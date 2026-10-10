@@ -4,125 +4,127 @@
 #include <ros/ros.h>
 
 #include <Eigen/Core>
-#include <queue>
+#include <vector>
+#include <random>
 
 namespace prediction {
 
-struct Node {
-  Eigen::Vector3d p, v, a;
-  double t;
-  double score;
-  double h;
-  Node* parent = nullptr;
+struct Primitive {
+  std::vector<Eigen::Vector3d> pts;
+  double cost;
+  bool valid;
 };
-typedef Node* NodePtr;
-class NodeComparator {
- public:
-  bool operator()(NodePtr& lhs, NodePtr& rhs) {
-    return lhs->score + lhs->h > rhs->score + rhs->h;
-  }
-};
-struct Predict {
- private:
-  static constexpr int MAX_MEMORY = 1 << 22;
-  // searching
-
+class Predict {
+private:
   double dt;
   double pre_dur;
   double rho_a;
-  double car_z, vmax;
+  double vmax;
+  int primitive_num;
   mapping::OccGridMap map;
-  NodePtr data[MAX_MEMORY];
-  int stack_top;
 
   inline bool isValid(const Eigen::Vector3d& p, const Eigen::Vector3d& v) const {
     return (v.norm() < vmax) && (!map.isOccupied(p));
   }
 
- public:
-  inline Predict(ros::NodeHandle& nh) {
-    nh.getParam("tracking_dur", pre_dur);
-    nh.getParam("tracking_dt", dt);
-    nh.getParam("prediction/rho_a", rho_a);
-    nh.getParam("prediction/vmax", vmax);
-    for (int i = 0; i < MAX_MEMORY; ++i) {
-      data[i] = new Node;
+  Primitive generatePrimitive(const Eigen::Vector3d& p0,
+                              const Eigen::Vector3d& v0,
+                              const Eigen::Vector3d& pf) {
+    Primitive prim;
+    prim.cost = 0;
+    prim.valid = true;
+    double T = pre_dur;
+
+    // cubic Bernstein
+    Eigen::Vector3d c0 = p0;
+    Eigen::Vector3d c1 = p0 + v0 * T / 3.0;
+    Eigen::Vector3d c2 = 0.5 * p0 + 0.5 * pf + v0 * T / 6.0;
+    Eigen::Vector3d c3 = pf;
+    int N = static_cast<int>(pre_dur / dt);
+
+    for (int i=0;i<=N;++i) {
+      double s = static_cast<double>(i) / N;
+      double b0 = pow(1-s, 3);
+      double b1 = 3 * s * pow(1-s, 2);
+      double b2 = 3 * (1-s) * pow(s, 3);
+      double b3 = pow(s, 3);
+      Eigen::Vector3d p = b0 * c0 + b1 * c1 + b2 * c2 + b3 * c3;
+
+      if (!isValid(p, v0)) {
+        prim.valid = false;
+        return prim;
+      }
+
+      prim.pts.push_back(p);
+      prim.cost += (p-pf).squaredNorm();
     }
+
+    return prim;
   }
+
+public:
+  // Predict(ros::NodeHandle& nh) {
+  //   nh.getParam("tracking_dur", pre_dur);
+  //   nh.getParam("tracking_dt", dt);
+  //   nh.getParam("prediction/rho_a", rho_a);
+  //   nh.getParam("prediction/vmax", vmax);
+  //   primitive_num = 100;
+  // }
+
   inline void setMap(const mapping::OccGridMap& _map) {
     map = _map;
     // map.inflate_last();
   }
 
-  inline bool predict(const Eigen::Vector3d& target_p,
-                      const Eigen::Vector3d& target_v,
-                      std::vector<Eigen::Vector3d>& target_predcit,
-                      const double& max_time = 0.1) {
-    auto score = [&](const NodePtr& ptr) -> double {
-      return rho_a * ptr->a.norm();
-    };
-    Eigen::Vector3d end_p = target_p + target_v * pre_dur;
-    auto calH = [&](const NodePtr& ptr) -> double {
-      return 0.001 * (ptr->p - end_p).norm();
-    };
+  bool predict(const Eigen::Vector3d& target_p,
+               const Eigen::Vector3d& target_v,
+               std::vector<Eigen::Vector3d>& target_predict,
+               const double& max_time = 0.1) {
+    std::vector<Primitive> candidates;
     ros::Time t_start = ros::Time::now();
-    std::priority_queue<NodePtr, std::vector<NodePtr>, NodeComparator> open_set;
-
-    Eigen::Vector3d input(0, 0, 0);
-
-    stack_top = 0;
-    NodePtr curPtr = data[stack_top++];
-    curPtr->p = target_p;
-    curPtr->v = target_v;
-    curPtr->a.setZero();
-    curPtr->parent = nullptr;
-    curPtr->score = 0;
-    curPtr->h = 0;
-    curPtr->t = 0;
-    double dt2_2 = dt * dt / 2;
-    while (curPtr->t < pre_dur) {
-      for (input.x() = -3; input.x() <= 3; input.x() += 3)
-        for (input.y() = -3; input.y() <= 3; input.y() += 3) {
-          Eigen::Vector3d p = curPtr->p + curPtr->v * dt + input * dt2_2;
-          Eigen::Vector3d v = curPtr->v + input * dt;
-          if (!isValid(p, v)) {
-            continue;
-          }
-          if (stack_top == MAX_MEMORY) {
-            std::cout << "[prediction] out of memory!" << std::endl;
-            return false;
-          }
-          double t_cost = (ros::Time::now() - t_start).toSec();
-          if (t_cost > max_time) {
-            std::cout << "[prediction] too slow!" << std::endl;
-            return false;
-          }
-          NodePtr ptr = data[stack_top++];
-          ptr->p = p;
-          ptr->v = v;
-          ptr->a = input;
-          ptr->parent = curPtr;
-          ptr->t = curPtr->t + dt;
-          ptr->score = curPtr->score + score(ptr);
-          ptr->h = calH(ptr);
-          open_set.push(ptr);
-          // std::cout << "open set push: " << state.transpose() << std::endl;
-        }
-      if (open_set.empty()) {
-        std::cout << "[prediction] no way!" << std::endl;
+    
+    // Sample(Nearly Constant Velocity Model)
+    std::default_random_engine gen;
+    std::normal_distribution<double> noise(0, 0.5);
+    
+    for (int i=0;i<primitive_num;++i) {
+      double t_cost = (ros::Time::now() - t_start).toSec();
+      if (t_cost > max_time) {
+        std::cout << "[prediction] too slow!" << std::endl;
         return false;
       }
-      curPtr = open_set.top();
-      open_set.pop();
+      
+      Eigen::Vector3d end = target_p + target_v * pre_dur;
+      end.x() += noise(gen);
+      end.y() += noise(gen);
+      end.z() += noise(gen);
+
+      auto prim = generatePrimitive(target_p, target_v, end);
+      if (prim.valid) candidates.push_back(prim);
     }
-    target_predcit.clear();
-    while (curPtr != nullptr) {
-      target_predcit.push_back(curPtr->p);
-      curPtr = curPtr->parent;
+
+    if (candidates.empty()) return false;
+
+    // Selection
+    double best = 1e9;
+    int index = -1;
+
+    for (int i=0;i<candidates.size();i++) {
+      double t_cost = (ros::Time::now() - t_start).toSec();
+      if (t_cost > max_time) {
+        std::cout << "[prediction] too slow!" << std::endl;
+        return false;
+      }
+      
+      if (candidates[i].cost < best) {
+        best = candidates[i].cost;
+        index = i;
+      }
     }
-    std::reverse(target_predcit.begin(), target_predcit.end());
+
+    target_predict = candidates[index].pts;
     return true;
   }
 };
 
-}  // namespace prediction
+}
